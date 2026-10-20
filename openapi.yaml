@@ -1,0 +1,1113 @@
+openapi: 3.1.0
+info:
+  title: Cloud PVE Client API
+  version: 1.0.0
+  summary: Public REST API of the Cloud PVE VPS control panel
+  description: |
+    Manage your virtual servers over HTTP: list and inspect servers, power actions, reinstall, password reset,
+    console tickets, metrics, reverse DNS, operations, the audit log and your API tokens.
+
+    ## Versioning and compatibility
+
+    The API is versioned in the path. This document describes **v1** (`/api/v1/...`), API version `1.0.0`.
+    Within v1 only backwards-compatible (additive) changes are made: new endpoints, new optional request fields,
+    new response fields, new enum values, new error codes. Write clients that ignore unknown response fields and
+    treat enums as open. A breaking change is released as a new major version (`/api/v2`); v1 stays available for at
+    least 6 months after v2 is announced. A deprecated operation is marked `deprecated: true` here and answers with the
+    `Deprecation` (RFC 9745) and `Sunset` (RFC 8594) headers. The history of changes is in the
+    [changelog](/api/v1/changelog.md) and in the public repository of this specification.
+
+    ## Conventions
+
+    JSON, `snake_case`, RFC 3339 UTC timestamps, UUID ids. Errors are RFC 9457 `application/problem+json`.
+    A VM that belongs to another account is always `404 not_found`. Cookie-authenticated mutations
+    (POST/PATCH/PUT/DELETE) require an `Origin` header equal to the configured origin of the app, otherwise
+    `403 bad_origin`.
+
+    ## Authentication
+
+    Scripts authenticate with `Authorization: Bearer cpv_<prefix>_<secret>` instead of a cookie (create a token in the
+    client app, section API tokens). Token requests need no `Origin`. Every operation lists the scope it needs in
+    `x-required-scope` (`resource:action`); entries of a token may be wildcards (`vms:*`, `*:read`, `*`), which never
+    cover the sensitive scopes `api_tokens:write` and `operations:reveal`. `session-only` operations are closed to
+    tokens.
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+  x-api-lifecycle:
+    stage: stable
+    version: 1.0.0
+    path-prefix: /api/v1
+    compatibility: additive-only within a major version
+    deprecation:
+      signals:
+        - "OpenAPI `deprecated: true` on the operation"
+        - "`Deprecation` response header (RFC 9745)"
+        - "`Sunset` response header (RFC 8594)"
+      min-overlap-months: 6
+    changelog: /api/v1/changelog.md
+servers:
+  - url: https://my.example.com
+    description: Client app host (`/api/v1`, `/auth`, `/ws`)
+tags:
+  - name: client-auth
+    description: Client sessions (SSO from WHMCS, impersonation)
+  - name: client-vms
+    description: Client app, virtual machines
+  - name: client-ops
+    description: Client app, operations, audit, console
+  - name: client-tokens
+    description: Client app, API tokens (scopes, VM and IP restrictions)
+  - name: client-docs
+    description: This API's specification (OpenAPI 3), public
+  - name: system
+    description: Health
+security:
+  - clientCookie: []
+  - clientBearer: []
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: healthz
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: {type: boolean}
+  /auth/sso:
+    get:
+      tags: [client-auth]
+      operationId: authSso
+      summary: Sign in with a WHMCS SSO token
+      description: |
+        Verifies the account-level token issued by the WHMCS addon `cloudpve`
+        (`base64url(payload).base64url(HMAC-SHA256)`, payload `{cid, email, name, lang, return?, iat, exp, nonce}`;
+        see CONTRACT.md section 5), creates the client session cookie `__Host-sid` and redirects to the
+        token's `return` path, or `/`. `return` is re-validated: a panel-relative path of `A-Za-z0-9/_.-`
+        starting with `/`, without `//`; anything else is ignored (redirect to `/`).
+        On failure redirects to `/login?error=sso_invalid`.
+      security: []
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        "302":
+          description: Redirect (success or failure, see description)
+          headers:
+            Location: {schema: {type: string}}
+            Set-Cookie: {schema: {type: string}, description: "`__Host-sid` on success"}
+  /auth/impersonate:
+    get:
+      tags: [client-auth]
+      operationId: authImpersonate
+      summary: Start an impersonation session (staff, one-time code)
+      security: []
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        "302":
+          description: Redirect to `/` with an impersonation session cookie
+          headers:
+            Location: {schema: {type: string}}
+  /api/v1/auth/logout:
+    post:
+      tags: [client-auth]
+      operationId: clientLogout
+      x-required-scope: session-only
+      summary: Sign out
+      responses:
+        "204": {description: Signed out}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/config:
+    get:
+      tags: [client-auth]
+      operationId: clientConfig
+      summary: Public app configuration
+      security: []
+      responses:
+        "200":
+          description: Config
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [whmcs_url, brand]
+                properties:
+                  whmcs_url: {type: string, format: uri, description: "Base URL of WHMCS (WHMCS_URL); the sign-in button opens `{whmcs_url}/index.php?m=cloudpve_sso&return=<path>`"}
+                  brand: {type: string}
+  /api/v1/me:
+    get:
+      tags: [client-auth]
+      operationId: clientMe
+      x-required-scope: account:read
+      summary: Current account
+      responses:
+        "200":
+          description: Account and impersonation state
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ClientMe"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    patch:
+      tags: [client-auth]
+      operationId: clientUpdateMe
+      x-required-scope: account:write
+      summary: Update locale
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [locale]
+              properties:
+                locale: {$ref: "#/components/schemas/Locale"}
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ClientMe"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationFailed"}
+  /api/v1/vms:
+    get:
+      tags: [client-vms]
+      operationId: clientListVms
+      x-required-scope: vms:read
+      summary: List own VMs
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: q
+          in: query
+          description: Search by name, hostname or IP
+          schema: {type: string}
+      responses:
+        "200":
+          description: Page of VMs
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VmPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/vms/{id}:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    get:
+      tags: [client-vms]
+      operationId: clientGetVm
+      x-required-scope: vms:read
+      summary: Get a VM
+      responses:
+        "200":
+          description: VM
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Vm"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    patch:
+      tags: [client-vms]
+      operationId: clientRenameVm
+      x-required-scope: vms:rename
+      summary: Rename a VM
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string, minLength: 1, maxLength: 64}
+      responses:
+        "200":
+          description: Updated VM
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Vm"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationFailed"}
+  /api/v1/vms/{id}/ips/{ip}/rdns:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+      - name: ip
+        in: path
+        required: true
+        description: One of the VM's addresses (as listed in `ips[].ip`)
+        schema: {type: string}
+    put:
+      tags: [client-vms]
+      operationId: clientSetRdns
+      x-required-scope: vms:rdns
+      summary: Set the reverse DNS (PTR) of an address
+      description: |
+        The address must be the VM's own and lie in an enabled reverse zone (`422 ip: no_reverse_zone` otherwise);
+        `ptr` must be a valid host name (`422 ptr: invalid`). `501 dns_disabled` when no DNS server is configured.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/SetRdnsRequest"}
+      responses:
+        "200":
+          description: Stored; `ptr_synced` is false until the dns.ptr job has pushed it
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VmIp"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "422": {$ref: "#/components/responses/ValidationFailed"}
+        "501": {$ref: "#/components/responses/NotImplemented"}
+  /api/v1/vms/{id}/power:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    post:
+      tags: [client-vms]
+      operationId: clientPowerVm
+      x-required-scope: vms:power
+      summary: Power action
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PowerRequest"}
+      responses:
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /api/v1/vms/{id}/reset-password:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    post:
+      tags: [client-vms]
+      operationId: clientResetPassword
+      x-required-scope: vms:password
+      summary: Reset the root password
+      description: |
+        The new password is revealed once through `POST /api/v1/operations/{id}/reveal-secret`
+        (`has_secret` becomes true when the operation succeeds). It is set through the guest agent only: the VM
+        must be running (`409 invalid_state` otherwise) and the template must have a guest agent (`422 unsupported`);
+        an agent that does not answer fails the operation. The password (or its hash) is never written to the
+        hypervisor's cloud-init config; a leftover `cipassword` is removed.
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ResetPasswordRequest"}
+      responses:
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+  /api/v1/vms/{id}/templates:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    get:
+      tags: [client-vms]
+      operationId: clientVmTemplates
+      x-required-scope: vms:read
+      summary: Templates available for reinstall on the VM's node
+      responses:
+        "200":
+          description: Templates
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: "#/components/schemas/TemplateBrief"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/vms/{id}/reinstall:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    post:
+      tags: [client-vms]
+      operationId: clientReinstallVm
+      x-required-scope: vms:reinstall
+      summary: Reinstall from a template
+      description: |
+        All data is replaced. Requires `confirm_name` equal to the VM name. The VM always ends up running and
+        configured inside the guest (network on routed nodes, hostname, SSH keys, a NEW root password, all through the
+        guest agent), whatever its power state was. The new root password is revealed once to whoever started the
+        reinstall (`has_secret`), and is never stored in the hypervisor config.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ReinstallRequest"}
+      responses:
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/Unprocessable"}
+  /api/v1/vms/{id}/console:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    post:
+      tags: [client-ops]
+      operationId: clientConsole
+      x-required-scope: vms:console
+      summary: Open a VNC console
+      description: |
+        Returns a single-use ticket valid 30 s, bound to the session. Open `wss://<host><ws_url>`
+        (subprotocol `binary`) and give `password` to noVNC as the VNC credentials.
+        Idle timeout 15 min, at most 2 sessions per VM.
+      responses:
+        "200":
+          description: Console ticket
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ConsoleTicket"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /ws/console:
+    get:
+      tags: [client-ops]
+      operationId: clientConsoleWs
+      x-required-scope: vms:console
+      summary: Console WebSocket (RFB frames)
+      description: Upgrade to WebSocket, subprotocol `binary`. The ticket is single-use and valid for 30 s. Needs the session cookie or the API token that asked for the ticket (a token client sends no `Origin`).
+      security:
+        - clientCookie: []
+        - clientBearer: []
+      parameters:
+        - name: ticket
+          in: query
+          required: true
+          schema: {type: string}
+      responses:
+        "101": {description: Switching protocols}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/vms/{id}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    get:
+      tags: [client-vms]
+      operationId: clientVmMetrics
+      x-required-scope: vms:metrics
+      summary: Resource usage graphs
+      parameters:
+        - $ref: "#/components/parameters/Timeframe"
+      responses:
+        "200":
+          description: Metric points
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Metrics"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "503": {$ref: "#/components/responses/Unavailable"}
+  /api/v1/vms/{id}/operations:
+    parameters:
+      - $ref: "#/components/parameters/VmId"
+    get:
+      tags: [client-ops]
+      operationId: clientVmOperations
+      x-required-scope: operations:read
+      summary: Operations of a VM, newest first
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of operations
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OperationPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/operations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/OperationId"
+    get:
+      tags: [client-ops]
+      operationId: clientGetOperation
+      x-required-scope: operations:read
+      summary: Get an operation (poll every 2 s)
+      responses:
+        "200":
+          description: Operation
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Operation"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/operations/{id}/reveal-secret:
+    parameters:
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      tags: [client-ops]
+      operationId: clientRevealSecret
+      x-required-scope: operations:reveal
+      summary: Reveal the operation secret once
+      description: |
+        Returns the generated password once and deletes it; afterwards `404 not_found`. A password nobody revealed
+        is kept encrypted for at most `PASSWORD_REVEAL_TTL` (24 h by default), then deleted; a failed operation keeps none.
+      responses:
+        "200":
+          description: Secret
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/RevealedSecret"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/audit:
+    get:
+      tags: [client-ops]
+      operationId: clientAudit
+      x-required-scope: audit:read
+      summary: Audit log of own VMs
+      parameters:
+        - name: vm_id
+          in: query
+          schema: {type: string, format: uuid}
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of audit events
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AuditEventPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+  /api/v1/api-tokens:
+    get:
+      tags: [client-tokens]
+      operationId: clientListApiTokens
+      x-required-scope: api_tokens:read
+      summary: List own API tokens
+      description: Tokens of the account, newest first. The secret is shown once, at creation, and never again.
+      parameters:
+        - name: status
+          in: query
+          schema: {$ref: "#/components/schemas/ApiTokenStatus"}
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of tokens
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiTokenPage"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "422": {$ref: "#/components/responses/ValidationFailed"}
+    post:
+      tags: [client-tokens]
+      operationId: clientCreateApiToken
+      x-required-scope: api_tokens:write
+      summary: Create an API token
+      description: |
+        Returns the secret `cpv_<prefix>_<secret>` once. A token made with a token cannot exceed the scopes and the VM
+        list of the token that made it; support (impersonation) cannot create tokens. At most 50 active tokens per account.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApiTokenCreate"}
+      responses:
+        "201":
+          description: Created; carries the secret
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ApiTokenCreated"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/ValidationFailed"}
+  /api/v1/api-tokens/scopes:
+    get:
+      tags: [client-tokens]
+      operationId: clientListTokenScopes
+      x-required-scope: api_tokens:read
+      summary: Scopes a client token can hold
+      responses:
+        "200":
+          description: The catalog
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TokenScopeList"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+  /api/v1/api-tokens/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Id"
+    delete:
+      tags: [client-tokens]
+      operationId: clientRevokeApiToken
+      x-required-scope: api_tokens:write
+      summary: Revoke an API token
+      description: Idempotent. The token stops working at once. Tokens of other accounts are `404`.
+      responses:
+        "204": {description: Revoked}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/openapi.yaml:
+    get:
+      tags: [client-docs]
+      operationId: clientOpenapiYaml
+      summary: Client API specification (YAML)
+      security: []
+      description: Public, no session. Also rendered at `/docs/api` of the client app.
+      responses:
+        "200":
+          description: OpenAPI 3.1 document
+          content:
+            application/yaml:
+              schema: {type: string}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/openapi.json:
+    get:
+      tags: [client-docs]
+      operationId: clientOpenapiJson
+      summary: Client API specification (JSON)
+      security: []
+      description: Public, no session. Same document as `/api/v1/openapi.yaml`.
+      responses:
+        "200":
+          description: OpenAPI 3.1 document
+          content:
+            application/json:
+              schema: {type: string}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/changelog.md:
+    get:
+      tags: [client-docs]
+      operationId: clientChangelog
+      summary: API changelog (Markdown)
+      security: []
+      description: Public, no session. Changes of the client API per version, newest first. Also rendered at `/docs/api/changelog` of the client app.
+      responses:
+        "200":
+          description: Markdown document
+          content:
+            text/markdown:
+              schema: {type: string}
+        "404": {$ref: "#/components/responses/NotFound"}
+components:
+  securitySchemes:
+    clientCookie:
+      type: apiKey
+      in: cookie
+      name: __Host-sid
+      description: Client session. Mutations also need a matching `Origin` header.
+    clientBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: cpv_<prefix>_<secret>
+      description: |
+        Client API token (`Authorization: Bearer cpv_...`), made in the client app. No cookie, no `Origin`. The operation's
+        `x-required-scope` must be in the token's scopes; a token limited to some VMs sees only those VMs.
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    VmId:
+      name: id
+      in: path
+      required: true
+      description: VM id
+      schema: {type: string, format: uuid}
+    OperationId:
+      name: id
+      in: path
+      required: true
+      description: Operation id
+      schema: {type: string, format: uuid}
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `next_cursor`
+      schema: {type: string}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Timeframe:
+      name: timeframe
+      in: query
+      schema: {type: string, enum: [hour, day, week, month], default: hour}
+  responses:
+    OperationAccepted:
+      description: Accepted; poll the operation every 2 s
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Operation"}
+    Unauthorized:
+      description: No or expired session, bad token, MFA step pending
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Forbidden:
+      description: "`bad_origin`, `permission_denied`, `impersonation_read_only`, `vm_suspended`, `account_blocked`"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    NotFound:
+      description: Unknown resource or a VM of another account
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Conflict:
+      description: "`vm_busy` (with `operation_id`), `vm_not_ready`, `invalid_state`, `account_exists`, `ip_exhausted`, `ipam_conflict`, `no_capacity`, `location_in_use`, `pool_in_use`, `same_node`, `target_offline`, `other_location`, `no_storage`, `not_enough_ram`, `other_cluster`"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    ValidationFailed:
+      description: "`validation_failed`; `fields` holds per-field codes (`required`, `invalid`, `too_long`, `mismatch`, `taken`, `immutable`, `not_in_section`, `already_used`); `cluster_unreachable` when a new cluster fails its connection test"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    NotImplemented:
+      description: "`dns_disabled`: no DNS server is configured (`PDNS_API_URL` is empty)"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Unprocessable:
+      description: "`confirm_mismatch`, `unsupported` or `validation_failed`"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+    Unavailable:
+      description: "`hypervisor_unavailable` or `ipam_unavailable`"
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details. The frontend maps `code` to `errors.<code>`.
+      required: [type, title, status, code]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        code:
+          type: string
+          description: Stable machine-readable error code
+          enum:
+            - bad_request
+            - validation_failed
+            - unauthorized
+            - mfa_required
+            - mfa_enroll_required
+            - invalid_credentials
+            - invalid_totp
+            - rate_limited
+            - bad_origin
+            - permission_denied
+            - impersonation_read_only
+            - vm_suspended
+            - account_blocked
+            - not_found
+            - vm_busy
+            - vm_not_ready
+            - invalid_state
+            - confirm_mismatch
+            - unsupported
+            - hypervisor_unavailable
+            - ipam_unavailable
+            - ip_exhausted
+            - cluster_unreachable
+            - location_in_use
+            - pool_in_use
+            - ipam_subnet_not_found
+            - same_node
+            - target_offline
+            - other_location
+            - no_storage
+            - not_enough_ram
+            - other_cluster
+            - ipam_conflict
+            - no_capacity
+            - internal
+        detail: {type: string}
+        fields:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [required, invalid, too_long, mismatch]
+        operation_id: {type: string, format: uuid}
+    Locale:
+      type: string
+      enum: [ru, en]
+    PowerRequest:
+      type: object
+      required: [action]
+      properties:
+        action: {type: string, enum: [start, shutdown, stop, reboot, reset]}
+    ResetPasswordRequest:
+      type: object
+      properties:
+        user:
+          type: string
+          description: Defaults to the template default user
+          examples: [root]
+    ReinstallRequest:
+      type: object
+      required: [template_id, confirm_name]
+      properties:
+        template_id: {type: string, format: uuid}
+        confirm_name:
+          type: string
+          description: Must equal the VM name, otherwise `422 confirm_mismatch`
+    ConsoleTicket:
+      type: object
+      required: [ws_url, password, expires_in]
+      properties:
+        ws_url:
+          type: string
+          examples: ["/ws/console?ticket=..."]
+        password:
+          type: string
+          description: One-time VNC password for noVNC
+        expires_in: {type: integer, examples: [30]}
+    RevealedSecret:
+      type: object
+      required: [password]
+      properties:
+        password: {type: string}
+    VmStatus:
+      type: string
+      enum: [provisioning, active, reinstalling, deleting, deleted, error]
+    VmPower:
+      type: string
+      enum: [running, stopped, paused, unknown]
+    VmAction:
+      type: string
+      enum: [read, rename, power, console, reset_password, reinstall, metrics, audit]
+    Vm:
+      type: object
+      required: [id, name, status, power, suspended, cpu, ram_mb, disk_gb, ipv4, ipv6, ips, created_at, active_operation, _actions]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        hostname: {type: string}
+        status: {$ref: "#/components/schemas/VmStatus"}
+        power: {$ref: "#/components/schemas/VmPower"}
+        suspended: {type: boolean}
+        cpu: {type: integer}
+        ram_mb: {type: integer}
+        disk_gb: {type: integer}
+        ipv4:
+          type: array
+          items: {type: string}
+        ipv6:
+          type: array
+          items: {type: string, description: "For a delegated network the network address"}
+        ips:
+          type: array
+          description: Every address with its prefix and reverse DNS
+          items: {$ref: "#/components/schemas/VmIp"}
+        os:
+          type: [object, "null"]
+          properties:
+            template_id: {type: string, format: uuid}
+            name: {type: string}
+        location:
+          oneOf:
+            - type: object
+              required: [code, name, country]
+              properties:
+                code: {type: string, examples: [fra1]}
+                name: {type: string}
+                country: {type: string, description: ISO 3166-1 alpha-2 or empty}
+            - type: "null"
+          description: Location of the VM's node; null while the node has none
+        uptime_sec: {type: integer}
+        created_at: {type: string, format: date-time}
+        active_operation:
+          oneOf:
+            - $ref: "#/components/schemas/Operation"
+            - type: "null"
+        _actions:
+          type: array
+          items: {$ref: "#/components/schemas/VmAction"}
+    VmIp:
+      type: object
+      required: [ip, family, prefix, ptr, rdns_editable]
+      properties:
+        ip: {type: string, description: "The address; for a delegated IPv6 network its network address"}
+        family: {type: integer, enum: [4, 6]}
+        prefix: {type: integer, description: "32 for IPv4; 128 or the size of the delegated IPv6 network"}
+        ptr: {type: string, description: 'Reverse DNS name set by the customer, "" when none'}
+        ptr_synced: {type: boolean, description: "false while the dns.ptr job has not pushed ptr to the DNS server yet"}
+        rdns_editable:
+          type: boolean
+          description: A DNS server is configured and an enabled reverse zone covers the address
+        ptr_address:
+          type: string
+          description: "Present when the PTR record belongs to another address than `ip` (the ::1 of a delegated network)"
+    OperationType:
+      type: string
+      enum: [power.start, power.shutdown, power.stop, power.reboot, power.reset, create, reinstall, reset_password, resize, suspend, unsuspend, terminate, adopt, migrate, ip_add, ip_remove]
+    OperationStatus:
+      type: string
+      enum: [queued, running, succeeded, failed, canceled]
+    Operation:
+      type: object
+      required: [id, vm_id, type, status, has_secret, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        vm_id: {type: string, format: uuid}
+        type: {$ref: "#/components/schemas/OperationType"}
+        status: {$ref: "#/components/schemas/OperationStatus"}
+        step:
+          type: string
+          examples: [cloning]
+        progress: {type: integer, minimum: 0, maximum: 100}
+        error:
+          type: [object, "null"]
+          properties:
+            code: {type: string}
+            message: {type: string}
+        result:
+          type: object
+          description: |
+            `reset_password`: `{"method":"guest_agent","state":"applied"}` (the guest agent is the only method);
+            `resize`: `{"reboot_required": true}`;
+            `ip_add`: `{"address","family","prefix","pool_id"}`; `ip_remove`: `{"address"}`;
+            `create` / `reinstall` add `guest_network`: `applied`, `applied_without_password` (the `guest.netconfig` job
+            sets the password later), `applied_without_identity` (hostname / SSH keys retried by the job),
+            `pending` (the guest agent did not answer in time; the job keeps trying) or `unsupported` (the template has
+            no guest agent: no password is created, `has_secret` stays false). On every node the guest agent delivers
+            the hostname (`/etc/hostname`, `/etc/hosts`, `hostnamectl`), the ordered SSH public keys
+            (`/root/.ssh/authorized_keys`) and then the password; on a routed node also the network. The job reads the
+            password from the encrypted secret store by operation id: it is never in the job arguments.
+            The VM is started only after the node agent set its QEMU args; otherwise the operation fails with `agent_not_applied`.
+          additionalProperties: true
+        has_secret: {type: boolean}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, "null"], format: date-time}
+        finished_at: {type: [string, "null"], format: date-time}
+    MetricPoint:
+      type: object
+      required: [t, cpu, mem_used, mem_total, net_in, net_out, disk_read, disk_write]
+      properties:
+        t: {type: string, format: date-time}
+        cpu: {type: number, description: "Fraction 0..1 of allocated vCPU"}
+        mem_used: {type: number, description: bytes}
+        mem_total: {type: number, description: bytes}
+        net_in: {type: number, description: "bytes per second"}
+        net_out: {type: number, description: "bytes per second"}
+        disk_read: {type: number, description: "bytes per second"}
+        disk_write: {type: number, description: "bytes per second"}
+    Metrics:
+      type: object
+      required: [timeframe, points]
+      properties:
+        timeframe: {type: string, enum: [hour, day, week, month]}
+        points:
+          type: array
+          items: {$ref: "#/components/schemas/MetricPoint"}
+    ActorType:
+      type: string
+      enum: [client, staff, system, whmcs, api_token]
+      description: "`api_token`: a request made with an API token (`actor.id` is the token id, `display` its name and owner)"
+    AuditEvent:
+      type: object
+      required: [id, occurred_at, actor, action, result]
+      properties:
+        id: {type: integer, format: int64}
+        occurred_at: {type: string, format: date-time}
+        actor:
+          type: object
+          required: [type, display]
+          properties:
+            type: {$ref: "#/components/schemas/ActorType"}
+            display:
+              type: string
+              description: Staff actors appear as "Support" in the client view
+        action:
+          type: string
+          examples: [vm.power.start]
+        result: {type: string, enum: [success, failure, denied]}
+        resource:
+          type: object
+          properties:
+            type: {type: string, examples: [vm]}
+            id: {type: string}
+            name: {type: string}
+        ip: {type: string}
+        details:
+          type: object
+          additionalProperties: true
+    ApiTokenStatus:
+      type: string
+      enum: [active, expired, revoked]
+    ApiToken:
+      type: object
+      required: [id, name, prefix, owner_kind, owner_id, scopes, vm_ids, allowed_cidrs, expires_at, last_used_at, last_used_ip, created_at, revoked_at, status]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string, maxLength: 64}
+        prefix: {type: string, description: "Public part of the secret (`cpv_<prefix>_…`), 8 hex characters"}
+        owner_kind: {type: string, enum: [account, staff]}
+        owner_id: {type: string, format: uuid}
+        owner:
+          type: object
+          description: Admin view of all tokens only
+          properties:
+            email: {type: string}
+            name: {type: string}
+        scopes:
+          type: array
+          items: {type: string}
+          description: Entries are scopes (`vms:power`) or wildcards (`vms:*`, `*:read`, `*`); wildcards never cover sensitive scopes
+        vm_ids:
+          type: [array, "null"]
+          items: {type: string, format: uuid}
+          description: Client tokens. `null` is every VM of the account, future ones included
+        allowed_cidrs:
+          type: array
+          items: {type: string}
+          description: Empty is any source address
+        expires_at: {type: [string, "null"], format: date-time}
+        last_used_at: {type: [string, "null"], format: date-time, description: Updated at most once a minute}
+        last_used_ip: {type: [string, "null"]}
+        created_at: {type: string, format: date-time}
+        revoked_at: {type: [string, "null"], format: date-time}
+        status: {$ref: "#/components/schemas/ApiTokenStatus"}
+    ApiTokenCreated:
+      allOf:
+        - $ref: "#/components/schemas/ApiToken"
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: "`cpv_<prefix>_<secret>`, 77 characters. Shown only in this answer; only its SHA-256 is stored"
+    ApiTokenCreate:
+      type: object
+      required: [name, scopes]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 64}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: {type: string}
+        vm_ids:
+          type: array
+          maxItems: 100
+          items: {type: string, format: uuid}
+          description: Client tokens only; the VMs of the account the token is limited to. Omit for all VMs
+        allowed_cidrs:
+          type: array
+          maxItems: 20
+          items: {type: string}
+          description: Addresses or CIDRs the token may be used from. Omit for any address
+        expires_at:
+          type: string
+          format: date-time
+          description: At least a minute ahead, at most 5 years. Omit for a token that does not expire
+    TokenScope:
+      type: object
+      required: [scope, resource, action, sensitive]
+      properties:
+        scope: {type: string, examples: ["vms:power"]}
+        resource: {type: string}
+        action: {type: string}
+        sensitive: {type: boolean, description: "Granted only when listed by its exact name, never by a wildcard"}
+    TokenScopeList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/TokenScope"}
+    ApiTokenPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/ApiToken"}
+        next_cursor: {type: [string, "null"]}
+    VmPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Vm"}
+        next_cursor: {type: string}
+    OperationPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/Operation"}
+        next_cursor: {type: string}
+    AuditEventPage:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: "#/components/schemas/AuditEvent"}
+        next_cursor: {type: string}
+    ClientMe:
+      type: object
+      required: [account, impersonation]
+      properties:
+        account:
+          type: object
+          required: [id, email, name, locale]
+          properties:
+            id: {type: string, format: uuid}
+            email: {type: string, format: email}
+            name: {type: string}
+            locale: {$ref: "#/components/schemas/Locale"}
+        impersonation:
+          type: [object, "null"]
+          properties:
+            staff_name: {type: string}
+            mode: {type: string, enum: [read, write]}
+            expires_at: {type: string, format: date-time}
+    TemplateBrief:
+      type: object
+      required: [id, name, os_family]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        os_family: {type: string}
+    SetRdnsRequest:
+      type: object
+      additionalProperties: false
+      required: [ptr]
+      properties:
+        ptr: {type: string, description: 'Fully qualified host name (two or more labels); "" removes the record'}
